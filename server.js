@@ -150,7 +150,8 @@ wss.on('connection', (ws, req) => {
                 name: row.name
               }
             }));
-            clientsId.set(row.id, ws); 
+            clientsId.set(row.id, ws);
+            ws.userId = row.id;
           } else {
               ws.send(JSON.stringify({
               type: 'login_result',
@@ -167,21 +168,36 @@ wss.on('connection', (ws, req) => {
 
         if(!nameregistr || !passwordregistr) return;
         
-        db.run(`INSERT INTO registration (name, password) VALUES (?, ?)`, [nameregistr, passwordregistr], (err) => {
+        db.get(`SELECT id FROM registration WHERE name = ?`, [nameregistr], (err, existing) => {
+          if (err) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Ошибка БД' }));
+            return;
+          }
+          if (existing) {
+            ws.send(JSON.stringify({
+              type: 'register_result',
+              success: false,
+              message: 'Пользователь с таким именем уже существует'
+            }));
+            return;
+          }
+          db.run(`INSERT INTO registration (name, password) VALUES (?, ?)`, [nameregistr, passwordregistr], function (err) {
             if (err) {
               ws.send(JSON.stringify({
-                type: 'error',
+                type: 'register_result',
+                success: false,
                 message: 'Ошибка записи в БД'
               }));
               return;
             }
-        });
-        ws.send(JSON.stringify({
-          type: 'register_result',
-          message: 'Регистрация прошла успешно'
-        }));
-        db.get(`SELECT id, name FROM registration WHERE name = ?`, [nameregistr], (err, row) => {
-          clientsId.set(row.id, ws);
+            clientsId.set(this.lastID, ws);
+            ws.userId = this.lastID;
+            ws.send(JSON.stringify({
+              type: 'register_result',
+              success: true,
+              message: 'Регистрация прошла успешно'
+            }));
+          });
         });
       }
       //////////// добавление в друзья
@@ -198,8 +214,24 @@ wss.on('connection', (ws, req) => {
             }));
             return;
           }
+          if (!row) {
+            ws.send(JSON.stringify({
+              type: 'name_friend_result',
+              success: false,
+              message: `Пользователь ${nameAdd} не найден`
+            }));
+            return;
+          }
+          if (row.name === send_invite_name) {
+            ws.send(JSON.stringify({
+              type: 'name_friend_result',
+              success: false,
+              message: 'Нельзя добавить в друзья самого себя'
+            }));
+            return;
+          }
           const friendSocket = clientsId.get(row.id);
-          if(!friendSocket){
+          if(!friendSocket || friendSocket.readyState !== 1){
             ws.send(JSON.stringify({
               type: 'name_friend_result',
               success: false,
@@ -224,55 +256,37 @@ wss.on('connection', (ws, req) => {
       if(data.type === 'friend_accept'){
         const sender = String(data.sender || '').trim();
         const receiver = String(data.currentUserName || '').trim();
-        let get_invite_name = data.currentUserName;
-        db.get(`SELECT id, name FROM registration WHERE name = ?`, [sender], (err, row) => {
-          if(err){
-            ws.send(JSON.stringify({
-              type: 'error',
-              message: 'Ошибка БД'
-            }));
+        if (!sender || !receiver || sender === receiver) return;
+
+        const sendFriendList = (name, socket) => {
+          if (!socket || socket.readyState !== 1) return;
+          db.all(`SELECT friend_name FROM friends WHERE name = ?`, [name], (err, rows) => {
+            if (err) {
+              socket.send(JSON.stringify({ type: 'error', message: 'Ошибка БД' }));
+              return;
+            }
+            socket.send(JSON.stringify({ type: 'friend_list', friends: rows }));
+          });
+        };
+
+        db.get(`SELECT id FROM friends WHERE name = ? AND friend_name = ?`, [receiver, sender], (err, existing) => {
+          if (err) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Ошибка БД' }));
             return;
           }
-          const friendSocket2 = clientsId.get(row.id);
-
-          db.all(`SELECT friend_name FROM friends WHERE name = ?`, [sender], (err, rows) => {
-            if (err) {
-              ws.send(JSON.stringify({
-                type: 'error',
-                message: 'Ошибка БД'
-              }));
-              return;
+          db.serialize(() => {
+            if (!existing) {
+              db.run(`INSERT INTO friends (name, friend_name) VALUES (?, ?)`, [sender, receiver]);
+              db.run(`INSERT INTO friends (name, friend_name) VALUES (?, ?)`, [receiver, sender]);
             }
-            friendSocket2.send(JSON.stringify({
-              type: 'friend_list',
-              friends: rows
-            }));
-            
-
+            db.get(`SELECT id FROM registration WHERE name = ?`, [sender], (err, row) => {
+              sendFriendList(receiver, ws);
+              if (!err && row) sendFriendList(sender, clientsId.get(row.id));
+            });
           });
-          db.all(`SELECT friend_name FROM friends WHERE name = ?`, [receiver], (err, rows) => {
-            if (err) {
-              ws.send(JSON.stringify({
-                type: 'error',
-                message: 'Ошибка БД'
-              }));
-              return;
-            }
-            ws.send(JSON.stringify({
-              type: 'friend_list',
-              friends: rows
-            }));
-          });
-          
         });
-
-          db.run(`INSERT INTO friends (name, friend_name) VALUES (?, ?)`,
-          [sender, receiver]);
-
-          db.run(`INSERT INTO friends (name, friend_name) VALUES (?, ?)`,
-          [receiver, sender]);
       }
-      
+
       if (data.type === 'friends') {
         const name = String(data.name || '').trim();
 
@@ -302,6 +316,9 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     clients.delete(ws);
+    if (ws.userId && clientsId.get(ws.userId) === ws) {
+      clientsId.delete(ws.userId);
+    }
     console.log('Пользователь отключился');
   });
 
